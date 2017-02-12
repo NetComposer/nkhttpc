@@ -1,0 +1,12 @@
+{application, nkhttpc, [
+    {description, "NetComposer HTTP client"},
+    {vsn, "develop"},
+    {modules, []},
+    {registered, []},
+    {mod, {nkhttpc_app, []}},
+    {applications, [
+        nkpacket
+    ]},
+    {env, [
+    ]}
+]}.

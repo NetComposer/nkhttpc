@@ -1,0 +1,6 @@
+log
+ebin
+deps
+data
+.DS_Store
+/data/objs
