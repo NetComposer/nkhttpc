@@ -4,3 +4,7 @@ deps
 data
 .DS_Store
 /data/objs
+.rebar3
+.idea
+nkhttpc.iml
+nkhttpc.version

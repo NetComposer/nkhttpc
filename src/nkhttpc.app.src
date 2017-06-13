@@ -5,7 +5,7 @@
     {registered, []},
     {mod, {nkhttpc_app, []}},
     {applications, [
-        nkpacket
+        nkpacket, poolboy
     ]},
     {env, [
     ]}
