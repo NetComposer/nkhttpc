@@ -48,6 +48,7 @@
     #{  
         ?TLS_TYPES,
         host => binary(),
+        path => binary(),                       % Base path
         headers => [{binary(), binary()}],
         auth => {basic, binary(), binary()},
         idle_timeout => integer(),
@@ -143,6 +144,7 @@ get_all() ->
     conns :: list(),
     conn_opts :: map(),
     host :: binary(),
+    path :: binary(),
     hds :: [{binary(), binary()}],
     conn_pid :: pid(),
     reqs = [] ::[#req{}],
@@ -172,6 +174,7 @@ init([Id, Conns, Opts]) ->
         conns = Conns,
         conn_opts = ConnOpts,
         host = maps:get(host, Opts, <<>>),
+        path = nklib_parse:path(maps:get(path, Opts, <<>>)),
         hds = get_headers(Opts),
         debug = maps:get(debug, Opts, false),
         refresh_interval = maps:get(refresh_interval, Opts, 0),
@@ -192,9 +195,13 @@ end.
     {noreply, #state{}} | {reply, term(), #state{}} | {stop, term(), term(), #state{}}.
 
 handle_call({req, Method, Path, Hds, Body}, From, #state{reqs=Reqs}=State) ->
-    #state{hds=BaseHds, conn_pid=ConnPid} = State,
+    #state{hds=BaseHds, path=BasePath, conn_pid=ConnPid} = State,
     Ref = make_ref(),
-    Msg = {http, Ref, Method, Path, BaseHds++Hds, Body},
+    Path2 = case BasePath of
+        <<>> -> Path;
+        _ -> <<BasePath/binary, Path/binary>>
+    end,
+    Msg = {http, Ref, Method, Path2, BaseHds++Hds, Body},
     ?DEBUG("send ~p", [Msg], State),
     case nkpacket:send(ConnPid, Msg) of
         {ok, _} ->
