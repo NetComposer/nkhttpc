@@ -5,13 +5,12 @@
 
 t1() ->
     Opts = #{
-        % host => "cluster.netc.io", 
-        host => "1.2.3.4", 
+        host => "1.2.3.4",
         port => 443, 
         proto => tls, 
         debug => true,
         pool_size => 3,
-        auth => {basic, "user", "es"}
+        auth => {basic, "user", "clave"}
     },
     nkhttpc:start_link(Opts).
 

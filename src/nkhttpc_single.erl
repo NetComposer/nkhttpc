@@ -32,6 +32,15 @@
 -include_lib("nkpacket/include/nkpacket.hrl").
 
 
+%% ===================================================================
+%% Types
+%% ===================================================================
+
+-type method() :: atom() | binary().
+-type path() :: binary().
+-type header() :: {binary(), binary()}.
+-type body() :: iolist().
+-type status() :: 100..599.
 
 -type conn() :: {tcp|tls, inet:ip_address(), inet:port_number()}.
 
@@ -43,7 +52,9 @@
         auth => {basic, binary(), binary()},
         idle_timeout => integer(),
         debug => boolean(),
-        packet_debug => boolean()
+        packet_debug => boolean(),
+        refresh_fun => fun((Pid::pid()) -> ok),
+        refresh_request => {method(), path(), [header()], body}
     }.
 
 
@@ -91,8 +102,8 @@ stop(Pid) ->
 
 %% @doc Sends a message
 %% Every connection has a timeout, so it will never block
--spec req(pid(), binary(), binary(), [{binary(), binary()}], binary()|iolist(), integer()) ->
-    {ok, integer(), [{binary(), binary()}], binary(), integer()} | {error, term()}.
+-spec req(pid(), method(), path(), [header()], body(), integer()) ->
+    {ok, status(), [header()], binary(), integer()} | {error, term()}.
 
 req(Pid, Method, Path, Hds, Body, Timeout) ->
     Method2 = nklib_util:to_upper(Method),
@@ -129,13 +140,14 @@ get_all() ->
 
 -record(state, {
     id :: term(),
-    opts :: map(),
     conns :: list(),
     conn_opts :: map(),
     host :: binary(),
     hds :: [{binary(), binary()}],
     conn_pid :: pid(),
-    req = undefined :: #req{},
+    reqs = [] ::[#req{}],
+    refresh_interval :: integer(),
+    refresh_request :: {method(), path(), [header()], body()},
     debug :: boolean()
 }).
 
@@ -157,14 +169,18 @@ init([Id, Conns, Opts]) ->
     },
     State = #state{
         id = Id,
-        opts = Opts,
         conns = Conns,
         conn_opts = ConnOpts,
-        debug = maps:get(debug, Opts, false)
+        host = maps:get(host, Opts, <<>>),
+        hds = get_headers(Opts),
+        debug = maps:get(debug, Opts, false),
+        refresh_interval = maps:get(refresh_interval, Opts, 0),
+        refresh_request = maps:get(refresh_request, Opts, undefined)
     },
     case connect(State) of
         {ok, Ip, State2} ->
             ?LLOG(info, "new connection (~s)", [nklib_util:to_host(Ip)], State),
+            self() ! refresh,
             {ok, State2};
         {error, Error} ->
             {stop, Error}
@@ -175,7 +191,7 @@ end.
 -spec handle_call(term(), {pid(), reference()}, #state{}) ->
     {noreply, #state{}} | {reply, term(), #state{}} | {stop, term(), term(), #state{}}.
 
-handle_call({req, Method, Path, Hds, Body}, From, #state{req=undefined}=State) ->
+handle_call({req, Method, Path, Hds, Body}, From, #state{reqs=Reqs}=State) ->
     #state{hds=BaseHds, conn_pid=ConnPid} = State,
     Ref = make_ref(),
     Msg = {http, Ref, Method, Path, BaseHds++Hds, Body},
@@ -186,13 +202,10 @@ handle_call({req, Method, Path, Hds, Body}, From, #state{req=undefined}=State) -
                 ref = Ref,
                 from = From
             },
-            {noreply, State#state{req=Req}};
+            {noreply, State#state{reqs=Reqs++[Req]}};
         {error, Error} ->
             {error, Error, State}
     end;
-
-handle_call({req, _Method, _Path, _Body, _Opts}, _From, State) ->
-    {reply, {error, request_not_finished}, State};
 
 handle_call(get_state, _From, State) ->
     {reply, State, State};
@@ -218,21 +231,21 @@ handle_cast(Msg, State) ->
 -spec handle_info(term(), #state{}) ->
     {noreply, #state{}} | {stop, term(), #state{}}.
 
-handle_info({nkhttpc, Ref, {head, Status, Hds}}, #state{req=Req}=State) ->
+handle_info({nkhttpc, Ref, {head, Status, Hds}}, #state{reqs=Reqs}=State) ->
     ?DEBUG("head: ~p, ~p", [Status, Hds], State),
-    #req{ref=Ref} = Req,
+    [#req{ref=Ref}=Req|Rest] = Reqs,
     Req2 = Req#req{status=Status, hds=Hds},
-    {noreply, State#state{req=Req2}};
+    {noreply, State#state{reqs=[Req2|Rest]}};
 
-handle_info({nkhttpc, Ref, {chunk, Data}}, #state{req=Req}=State) ->
+handle_info({nkhttpc, Ref, {chunk, Data}}, #state{reqs=Reqs}=State) ->
     % ?DEBUG("chunk: ~p", [Data]),
-    #req{ref=Ref, chunks=Chunks} = Req,
+    [#req{ref=Ref, chunks=Chunks}=Req|Rest] = Reqs,
     Req2 = Req#req{chunks=[Data|Chunks]},
-    {noreply, State#state{req=Req2}};
+    {noreply, State#state{reqs=[Req2|Rest]}};
 
-handle_info({nkhttpc, Ref, {body, Body}}, #state{req=Req}=State) ->
+handle_info({nkhttpc, Ref, {body, Body}}, #state{reqs=Reqs}=State) ->
     ?DEBUG("body: ~p", [Body], State),
-    #req{ref=Ref, status=Status, hds=Hds, from=From, chunks=Chunks} = Req,
+    [#req{ref=Ref, status=Status, hds=Hds, from=From, chunks=Chunks}|Rest]=Reqs,
     Body2 = case Chunks of
         [] ->
             Body;
@@ -242,12 +255,28 @@ handle_info({nkhttpc, Ref, {body, Body}}, #state{req=Req}=State) ->
             <<"invalid_chunked">>
     end,
     gen_server:reply(From, {ok, Status, Hds, Body2}),
-    {noreply, State#state{req=undefined}};
+    {noreply, State#state{reqs=Rest}};
+
+handle_info(refresh, #state{refresh_interval=0}=State) ->
+    {noreply, State};
+
+handle_info(refresh, #state{refresh_interval=Interval}=State) ->
+    #state{refresh_request={Method, Path, Hds, Body}} = State,
+    Self = self(),
+    spawn_link(
+        fun() ->
+            req(Self, Method, Path, Hds, Body, 1000*Interval),
+            erlang:send_after(1000*Interval, Self, refresh)
+        end),
+    {noreply, State};
 
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #state{conn_pid=Pid}=State) ->
-    case connect(State) of
+    lists:foreach(
+        fun(#req{from=From}) -> gen_server:reply(From, {error, process_down}) end,
+        State#state.reqs),
+    case connect(State#state{reqs=[]}) of
         {ok, Ip, State2} ->
-            lager:warning("NKLOG Reconnected"),
+            ?DEBUG("reconnected to ~p", [Ip], State),
             {noreply, State2};
         {error, _} ->
             case Reason of
@@ -290,7 +319,7 @@ connect(#state{conns=Conns, conn_opts=ConnOpts}=State) ->
     case connect(nklib_util:randomize(Conns), ConnOpts) of
         {ok, {_Proto, Ip, Port}, Pid} ->
             monitor(process, Pid),
-            State2 = get_headers(Ip, Port, State),
+            State2 = add_host(Ip, Port, State),
             State3 = State2#state{conn_pid = Pid},
             {ok, Ip, State3};
         {error, Error} ->
@@ -315,29 +344,29 @@ connect([{Proto, Ip, Port}|Rest], ConnOpts) ->
 
 
 %% @private
-get_headers(Ip, Port, #state{opts=Opts}=State) ->
-    Host = maps:get(host, Opts, Ip),
+get_headers(Opts) ->
+    Hds1 = maps:get(headers, Opts, []),
+    Hds2 = [{<<"Connection">>, <<"keep-alive">>}|Hds1],
+    case Opts of
+           #{auth:={basic, User, Pass}} ->
+               Auth = base64:encode(list_to_binary([User, ":", Pass])),
+               [{<<"Authorization">>, <<"Basic ", Auth/binary>>} | Hds2];
+           _ ->
+               Hds2
+    end.
+
+
+%% @private
+add_host(Ip, Port, #state{hds=Hds, host=Host}=State) ->
+    Name = case Host of
+               <<>> -> Ip;
+               _ -> Host
+           end,
     HostHeader = list_to_binary([
-        nklib_util:to_host(Host),
+        nklib_util:to_host(Name),
         <<":">>,
         nklib_util:to_binary(Port)
     ]),
-    nklib_proc:put(?MODULE, Host),
-    Hds1 = case maps:get(headers, Opts, []) of
-       [] ->
-           [
-               {<<"Host">>, HostHeader},
-               {<<"Connection">>, <<"keep-alive">>},
-               {<<"Accept">>, <<"*/*">>}
-           ];
-       UserHeaders ->
-           UserHeaders
-    end,
-    Hds2 = case Opts of
-       #{auth:={basic, User, Pass}} ->
-           Auth = base64:encode(list_to_binary([User, ":", Pass])),
-           [{<<"Authorization">>, <<"Basic ", Auth/binary>>} | Hds1];
-       _ ->
-           Hds1
-    end,
-    State#state{host=HostHeader, hds=Hds2}.
+    nklib_proc:put(?MODULE, Name),
+    Hds2 = nklib_util:store_value(<<"Host">>, HostHeader, Hds),
+    State#state{hds=Hds2}.
