@@ -160,7 +160,7 @@ get_all() ->
 }).
 
 -record(state, {
-    conns :: [nkpacket:raw_connection()],
+    conns :: [nkpacket:netspec()],
     conn_opts :: map(),
     hds :: [{binary(), binary()}],
     pool_size :: integer(),
