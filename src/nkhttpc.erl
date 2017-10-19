@@ -37,14 +37,14 @@
         host => string() | binary(),    % Default "127.0.0.1"
         port => inet:port_number(),     % Default 80
         proto => tcp | tls,             % Default tcp
-        ?TLS_TYPES,
         timeout => integer(),
         headers => [{binary(), binary()}],
         auth => {basic, binary(), binary()},
         timeout => integer(),
         debug => boolean(),
         packet_debug => boolean()
-    }.
+    }
+    | nkpacket:tls_types().
 
 -type req_opts() :: 
     #{
