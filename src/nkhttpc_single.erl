@@ -46,7 +46,6 @@
 
 -type conn_opts() ::
     #{  
-        ?TLS_TYPES,
         host => binary(),
         path => binary(),                       % Base path
         headers => [{binary(), binary()}],
@@ -56,7 +55,8 @@
         packet_debug => boolean(),
         refresh_fun => fun((Pid::pid()) -> ok),
         refresh_request => {method(), path(), [header()], body}
-    }.
+    }
+    | nkpacket:tls_types().
 
 
 -define(IDLE_TIMEOUT, 200000).
