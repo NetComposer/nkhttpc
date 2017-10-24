@@ -190,7 +190,7 @@ init([#{host:=Host}=Opts]) ->
             ConnOpts = TLSOpts#{
                 class => {nkhttpc, self()},
                 monitor => self(), 
-                user => {notify, self()}, 
+                user_state => {notify, self()},
                 idle_timeout => maps:get(timeout, Opts, ?TIMEOUT),
                 debug => maps:get(packet_debug, Opts, false)
             },
