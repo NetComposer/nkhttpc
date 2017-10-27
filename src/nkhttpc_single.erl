@@ -163,6 +163,7 @@ init([Id, Conns, Opts]) ->
     TLSKeys = nkpacket_util:tls_keys(),
     TLSOpts = maps:with(TLSKeys, Opts),
     ConnOpts = TLSOpts#{
+        id => Id,
         class => {nkhttpc, self()},
         monitor => self(),
         user => {notify, self()},
@@ -339,7 +340,7 @@ connect([], _ConnOpts) ->
     {error, no_connections};
 
 connect([{Proto, Ip, Port}|Rest], ConnOpts) ->
-    Conn = {nkhttpc_protocol, Proto, Ip, Port},
+    Conn = #nkconn{protocol=nkhttpc_protocol, ip=Ip, port=Port, opts=ConnOpts},
     case nkpacket:connect(Conn, ConnOpts) of
         {ok, Pid} ->
             {ok, {Proto, Ip, Port}, Pid};
