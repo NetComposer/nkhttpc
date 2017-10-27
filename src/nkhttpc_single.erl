@@ -23,7 +23,7 @@
 -author('Carlos Gonzalez <carlosj.gf@gmail.com>').
 -behaviour(gen_server).
 
--export([start_link/3, start/3, stop/1, req/6, get_all/0]).
+-export([start_link/2, start/2, stop/1, req/6, get_all/0]).
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2, 
          handle_info/2]).
 -export_type([conn/0, conn_opts/0]).
@@ -36,13 +36,14 @@
 %% Types
 %% ===================================================================
 
+-type id() :: term().
 -type method() :: atom() | binary().
 -type path() :: binary().
 -type header() :: {binary(), binary()}.
 -type body() :: iolist().
 -type status() :: 100..599.
 
--type conn() :: {tcp|tls, inet:ip_address(), inet:port_number()}.
+-type conn() :: {tcp|tls, inet:ip_address(), inet:port_number(), conn_opts()}.
 
 -type conn_opts() ::
     #{  
@@ -78,19 +79,25 @@
 
 
 %% @doc Starts a http connection
--spec start_link(term(), [conn()], conn_opts()) ->
+-spec start_link(id(), conn()|[conn()]) ->
     {ok, pid()} | {error, term()}.
 
-start_link(Id, Conns, Opts) ->
-    gen_server:start_link(?MODULE, [Id, Conns, Opts], []).
+start_link(Id, Conns) when is_list(Conns) ->
+    gen_server:start_link(?MODULE, [Id, Conns], []);
+
+start_link(Id, Conn) ->
+    start_link(Id, [Conn]).
 
 
 %% @doc Starts a http connection
--spec start(term(), [conn()], conn_opts()) ->
+-spec start([conn()], conn_opts()) ->
     {ok, pid()} | {error, term()}.
 
-start(Id, Conns, Opts) ->
-    gen_server:start(?MODULE, [Id, Conns, Opts], []).
+start(Id, Conns) when is_list(Conns) ->
+    gen_server:start(?MODULE, [Id, Conns], []);
+
+start(Id, Conn) ->
+    start(Id, [Conn]).
 
 
 %% @doc Stops a connection
@@ -146,6 +153,7 @@ get_all() ->
     host :: binary(),
     path :: binary(),
     hds :: [{binary(), binary()}],
+    conn_text = <<>> :: binary(),
     conn_pid :: pid(),
     reqs = [] ::[#req{}],
     refresh_interval :: integer(),
@@ -158,37 +166,17 @@ get_all() ->
 -spec init(term()) ->
     {ok, #state{}} | {stop, term()}.
 
-init([Id, Conns, Opts]) ->
+init([Id, Conns]) when is_list(Conns) ->
     nklib_proc:put(?MODULE, Id),
-    TLSKeys = nkpacket_util:tls_keys(),
-    TLSOpts = maps:with(TLSKeys, Opts),
-    ConnOpts = TLSOpts#{
-        id => Id,
-        class => {nkhttpc, self()},
-        monitor => self(),
-        user => {notify, self()},
-        idle_timeout => maps:get(idle_timeout, Opts, ?IDLE_TIMEOUT),
-        debug => maps:get(packet_debug, Opts, false)
-    },
-    State = #state{
-        id = Id,
-        conns = Conns,
-        conn_opts = ConnOpts,
-        host = maps:get(host, Opts, <<>>),
-        path = nklib_parse:path(maps:get(path, Opts, <<>>)),
-        hds = get_headers(Opts),
-        debug = maps:get(debug, Opts, false),
-        refresh_interval = maps:get(refresh_interval, Opts, 0),
-        refresh_request = maps:get(refresh_request, Opts, undefined)
-    },
+    State = #state{id=Id, conns=Conns},
     case connect(State) of
-        {ok, Ip, State2} ->
-            ?LLOG(info, "new connection (~s)", [nklib_util:to_host(Ip)], State),
+        {ok, #state{conn_text=Text}=State2} ->
+            ?LLOG(info, "new connection (~s)", [Text], State2),
             self() ! refresh,
             {ok, State2};
         {error, Error} ->
             {stop, Error}
-end.
+    end.
 
 
 %% @private
@@ -283,8 +271,8 @@ handle_info({'DOWN', _MRef, process, Pid, Reason}, #state{conn_pid=Pid}=State) -
         fun(#req{from=From}) -> gen_server:reply(From, {error, process_down}) end,
         State#state.reqs),
     case connect(State#state{reqs=[]}) of
-        {ok, Ip, State2} ->
-            ?DEBUG("reconnected to ~p", [Ip], State),
+        {ok, #state{conn_text=Text}=State2} ->
+            ?DEBUG("reconnected to ~s", [Text], State),
             {noreply, State2};
         {error, _} ->
             case Reason of
@@ -323,31 +311,48 @@ terminate(_Reason, State) ->
 %% ===================================================================
 
 %% @doc
-connect(#state{conns=Conns, conn_opts=ConnOpts}=State) ->
-    case connect(nklib_util:randomize(Conns), ConnOpts) of
-        {ok, {_Proto, Ip, Port}, Pid} ->
-            monitor(process, Pid),
-            State2 = add_host(Ip, Port, State),
-            State3 = State2#state{conn_pid = Pid},
-            {ok, Ip, State3};
-        {error, Error} ->
-            {error, Error}
-    end.
+connect(#state{conns=Conns}=State) ->
+    connect(nklib_util:randomize(Conns), State).
 
 
 %% @private
-connect([], _ConnOpts) ->
+connect([], _State) ->
     {error, no_connections};
 
-connect([{Proto, Ip, Port}|Rest], ConnOpts) ->
-    Conn = #nkconn{protocol=nkhttpc_protocol, ip=Ip, port=Port, opts=ConnOpts},
+connect([{Proto, Ip, Port, Opts}|Rest], #state{id=Id}=State) ->
+    TLSKeys = nkpacket_util:tls_keys(),
+    TLSOpts = maps:with(TLSKeys, Opts),
+    ConnOpts = TLSOpts#{
+        id => Id,
+        class => {nkhttpc, self()},
+        monitor => self(),
+        user_state => {notify, self()},
+        idle_timeout => maps:get(idle_timeout, Opts, ?IDLE_TIMEOUT),
+        debug => maps:get(packet_debug, Opts, false)
+    },
+    State2 = State#state{
+        conn_opts = ConnOpts,
+        host = maps:get(host, Opts, <<>>),
+        path = nklib_parse:path(maps:get(path, Opts, <<>>)),
+        hds = get_headers(Opts),
+        debug = maps:get(debug, Opts, false),
+        refresh_interval = maps:get(refresh_interval, Opts, 0),
+        refresh_request = maps:get(refresh_request, Opts, undefined)
+    },
+    Conn = #nkconn{protocol=nkhttpc_protocol, transp=Proto, ip=Ip, port=Port, opts=ConnOpts},
     case nkpacket:connect(Conn, ConnOpts) of
         {ok, Pid} ->
-            {ok, {Proto, Ip, Port}, Pid};
+            monitor(process, Pid),
+            State3 = add_host(Ip, Port, State2),
+            State4 = State3#state{
+                conn_pid = Pid,
+                conn_text = nkpacket_util:get_uri(http, Proto, Ip, Port)
+            },
+            {ok, State4};
         {error, Error} when Rest==[] ->
             {error, Error};
         {error, _Error} ->
-            connect(Rest, ConnOpts)
+            connect(Rest, State)
     end.
 
 
